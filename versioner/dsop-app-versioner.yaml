@@ -1,0 +1,212 @@
+---
+##  The MIT License (MIT)
+## 
+##  Copyright (c) 2022 Monkton, Inc
+## 
+##  Permission is hereby granted, free of charge, to any person obtaining a copy
+##  of this software and associated documentation files (the "Software"), to deal
+##  in the Software without restriction, including without limitation the rights
+##  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+##  copies of the Software, and to permit persons to whom the Software is
+##  furnished to do so, subject to the following conditions:
+## 
+##  The above copyright notice and this permission notice shall be included in all
+##  copies or substantial portions of the Software.
+## 
+##  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+##  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+##  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+##  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+##  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+##  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+##  SOFTWARE.
+## 
+AWSTemplateFormatVersion: 2010-09-09
+Description: Monkton DSO Core Versioner Lambda / NIST 800-53 Template for FedRAMP MODERATE/HIGH
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 20210825
+  Identifier:
+    Value: dsop-core-lambda-versioner
+  Input:
+    Description: This instantiates the versioning functions for a DoD DevSecOps Playbook
+  Output:
+    Description: N/A
+
+Resources:
+
+  DSOCodeMobilePipelineVersionerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "dsop-versioner-v2"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "lambda"
+            Action:
+              - lambda:InvokeFunction
+            Effect: "Allow"
+            Resource: 
+              - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:dsop-versioner-v2"
+
+
+  DSOCodeMobilePipelineVersionerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DSOCodeMobilePipelineVersionerExecutionRole
+    Properties:
+      FunctionName: !Sub "dsop-versioner-v2"
+      Handler: "index.handler"
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          // Create the DynamoDB service object
+          var ddb = new AWS.DynamoDB({apiVersion: '2012-08-10'});
+
+          async function updateItem(identifier, buildNumber) {
+              
+            // Create the DynamoDB service object
+            var ddb = new AWS.DynamoDB({apiVersion: '2012-08-10'});
+            
+            var params = {
+              TableName: 'dsop-versioner-v2',
+              Item: {
+                'versionKey': {S: identifier},
+                'buildNumber' : {N: buildNumber.toString()}
+              }
+            };
+            
+            // Call DynamoDB to add the item to the table
+            await ddb.putItem(params).promise()
+            
+          }
+
+          exports.handler = async (event, context) => {
+            
+            var appIdentifier = event.app
+            var buildVersion = event.version
+            var buildNumber = 1;
+            var update = event.readonly ? false : true;
+            
+            // Call DynamoDB to read the item from the table
+            var x = await ddb.getItem({ TableName: 'dsop-versioner-v2', Key: { 'versionKey': {S: appIdentifier + ':' + buildVersion} } }).promise()
+
+            if (x == null || x.Item == null) {
+              await updateItem(appIdentifier + ':' + buildVersion, buildNumber)
+            }
+            else {
+              buildNumber = parseInt(x.Item?.buildNumber.N);
+              
+              if (update) {
+                buildNumber = buildNumber + 1;
+                await updateItem(appIdentifier + ':' + buildVersion, buildNumber)
+              }
+            }
+
+            return {"buildNumber": buildNumber, "version": buildVersion, "app": appIdentifier, "versionPlusBuildNumber": buildVersion + "." + buildNumber.toString()}
+              
+          }
+
+      Role: !GetAtt DSOCodeMobilePipelineVersionerExecutionRole.Arn
+      Runtime: "nodejs14.x"
+      Timeout: 30
+      MemorySize: 512
+
+  DSOCodeMobilePipelineVersionerExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: 
+      - DSOKMSLambdaKey
+      - DSOKMSLambdaKeyAlias
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Sid: LogAccessPolicy
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+              - Sid: "kms"
+                Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition: 
+                  ForAnyValue:StringLike:
+                    kms:ResourceAliases: "alias/dsop/cf/versioning"
+              - Sid: dynamodb
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/dsop-versioner-v2'
+                      
+            Version: '2012-10-17'
+          PolicyName: "dsop-versioner-v2"
+      RoleName: !Sub "dsop-versioner-v2"
+
+
+
+
+
+  DSODynamoDBVersions:
+    Type: AWS::DynamoDB::Table
+    DependsOn: 
+      - DSOKMSLambdaKey
+      - DSOKMSLambdaKeyAlias
+    Properties: 
+      TableName: "dsop-versioner-v2"
+      AttributeDefinitions:
+        - AttributeName: 'versionKey'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'versionKey'
+          KeyType: 'HASH'
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: "alias/dsop/cf/versioning"
+      BillingMode: PAY_PER_REQUEST
+
+  DSOKMSLambdaKey: 
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: "KMS Key for all Versioning Lambda Secrets"
+      EnableKeyRotation: true
+      KeyPolicy: 
+        Version: "2012-10-17"
+        Id: "dsop-versioner-v2-kms-lambda"
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal: 
+              AWS: !Join ['', [ 'arn:', !Ref "AWS::Partition" , ':iam::', !Ref "AWS::AccountId" , ':root' ] ]
+            Action: "kms:*"
+            Resource: "*"
+  DSOKMSLambdaKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: "alias/dsop/cf/versioning"
+      TargetKeyId:
+        Ref: DSOKMSLambdaKey
