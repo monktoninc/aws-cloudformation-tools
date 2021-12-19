@@ -66,16 +66,8 @@ Parameters:
 
 Resources:
 
-  # A role needed for cross account connections. This can be referenced like so in other CF templates:
-  #
-  #   - PolicyName: app-cross-account-dynamodb-assume-role
-  #     PolicyDocument:
-  #       Statement:
-  #       - Effect: Allow
-  #         Action:
-  #           - sts:AssumeRole
-  #         Resource: 
-  #           - !Sub "arn:${AWS::Partition}:iam::${parAppSharedDataAccountId}:role/${parAppSharedDataRoleName}" 
+  # A role needed for cross account connections, assume this role in the Lambda function to 
+  # get data out of the DynamoDB table
   AppDynamoDBConnectionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -147,6 +139,7 @@ Resources:
             Principal: 
               AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
             Action: "kms:*"
+            # "*" is fine here as this is scoped to the key itself 
             Resource: "*"
   DSOKMSDynamoDBKeyAlias:
     Type: AWS::KMS::Alias
@@ -190,13 +183,13 @@ Resources:
         
           parDynamoDbKeyArn:
             Type: String
-            Description: "the ARN for the dynmodb table"
+            Description: "the ARN for the DynamoDB KMS Key"
           parDynamoDbTableArn:
             Type: String
-            Description: "The ARN for the DynamoDB table"
+            Description: "The ARN for the DynamoDB Table"
           parDynamoDbTableRegion:
             Type: String
-            Description: "The Region for the DynamoDB table"
+            Description: "The Region for the DynamoDB Table"
           parAccountId:
             Type: String
             Description: "The parent stack set account identifier"
