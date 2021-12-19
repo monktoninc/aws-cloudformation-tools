@@ -1,0 +1,125 @@
+---
+##  The MIT License (MIT)
+## 
+##  Copyright (c) 2022 Monkton, Inc
+## 
+##  Permission is hereby granted, free of charge, to any person obtaining a copy
+##  of this software and associated documentation files (the "Software"), to deal
+##  in the Software without restriction, including without limitation the rights
+##  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+##  copies of the Software, and to permit persons to whom the Software is
+##  furnished to do so, subject to the following conditions:
+## 
+##  The above copyright notice and this permission notice shall be included in all
+##  copies or substantial portions of the Software.
+## 
+##  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+##  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+##  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+##  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+##  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+##  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+##  SOFTWARE.
+## 
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Monkton DSO Core CloudFormation Custom Resource Provider Test
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 20210825
+  Identifier:
+    Value: dsop-core-cloudformation-lookup-resource-test
+  Input:
+    Description: This instantiates the data lookup functions, for CloudFormation, for a DoD DevSecOps Playbook
+  Output:
+    Description: N/A
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+
+      - Label:
+          default: StackSet Distribution Settings
+        Parameters:
+          - parProjectDeploymentOU
+          - parRegionDistribution
+
+    ParameterLabels:
+
+      parRegionDistribution:
+        Description: The regions the distribution of the templates should be targeted at
+      parProjectDeploymentOU: 
+        default: OU that is allowed to execute this function
+
+
+
+Parameters:
+    
+  parRegionDistribution:
+    Description: The regions the distribution of the templates should be targeted at
+    Type: String
+    Default: "us-gov-west-1,us-gov-east-1"
+  parProjectDeploymentOU:
+    Type: String
+    Description: "The org/root/ou path to deploy the execution lambda to"
+    MinLength: "0"
+    MaxLength: "100"
+    AllowedPattern: "^o-[a-z0-9]{10,32}\\/r-[0-9a-z]{4,32}\\/ou-[0-9a-z]{4,32}-[a-z0-9]{8,32}$"
+
+Resources:
+  DSOCodeDataLookupFunctionStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AutoDeployment:
+        Enabled: True
+        RetainStacksOnAccountRemoval: false
+      CallAs: DELEGATED_ADMIN
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      Description: Deploys the Lambda Web Application
+      OperationPreferences:
+        FailureTolerancePercentage: 0
+        MaxConcurrentPercentage: 100
+      PermissionModel: SERVICE_MANAGED
+      StackInstancesGroup:
+        - DeploymentTargets:
+            OrganizationalUnitIds:
+              - !Select [ 2 , !Split [ "/" , !Ref parProjectDeploymentOU ] ]
+          Regions: !Split [ ",", !Ref parRegionDistribution ]
+      StackSetName: !Sub "${AWS::StackName}-Website"
+      TemplateBody: |
+        Resources:
+          Stuff:
+            Type: AWS::SNS::Topic
+
+          # Looks up properties for automated deployments that we store within DynamoDB as configuration.
+          # The properties are looked up by key. The return values could be strings, string lists, 
+          # numbers, or maps. Maps enable you to put a bunch of values in the resulting data structure. 
+          PropertiesLookupTest:
+            Type: Custom::PropertiesLookup
+            Version: '1.0'
+            Properties:
+              # Identified the Lambda function which we will invoke for this custom resource
+              ServiceToken: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:dsop-tools-lookup"
+              # This is the lookup value that we will attempt to find from 
+              # storage. We key this value on the name of the application PLUS
+              # the account identifier. We may want to deploy everything with the same
+              # configuration—or potentially have different tenets which have account
+              # specific configurations. 
+              Value: !Sub "/website/${AWS::AccountId}/${AWS::Region}"
+              # This looks for the default value that maybe stored in the key. 
+              # This is useful for auto deployed StackSet Instances in AWS. 
+              DefaultLookupValue: "/website/default"
+              # This default value, in JSON format if the value or default 
+              # lookup are not able to be discerned
+              DefaultValueAsJson: "{ \"domainName\": \"smoke.monkton.io\" }"
+
+        Outputs:
+
+          # Produce the output
+          Something:
+            Description: The domain name that is configured for this stack
+            Value: !GetAtt PropertiesLookupTest.domainName
+
+            

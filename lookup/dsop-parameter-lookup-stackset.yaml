@@ -1,0 +1,469 @@
+---
+##  The MIT License (MIT)
+## 
+##  Copyright (c) 2022 Monkton, Inc
+## 
+##  Permission is hereby granted, free of charge, to any person obtaining a copy
+##  of this software and associated documentation files (the "Software"), to deal
+##  in the Software without restriction, including without limitation the rights
+##  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+##  copies of the Software, and to permit persons to whom the Software is
+##  furnished to do so, subject to the following conditions:
+## 
+##  The above copyright notice and this permission notice shall be included in all
+##  copies or substantial portions of the Software.
+## 
+##  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+##  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+##  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+##  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+##  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+##  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+##  SOFTWARE.
+## 
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Monkton DSO Core CloudFormation Data Lookup Custom Resource Provider / NIST 800-53 Template for FedRAMP MODERATE/HIGH
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 20210825
+  Identifier:
+    Value: dsop-core-cloudformation-lookup-resource
+  Input:
+    Description: This instantiates the data lookup functions, for CloudFormation, for a DoD DevSecOps Playbook
+  Output:
+    Description: N/A
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+
+      - Label:
+          default: StackSet Distribution Settings
+        Parameters:
+          - parProjectDeploymentOU
+          - parRegionDistribution
+
+    ParameterLabels:
+
+      parRegionDistribution:
+        Description: The regions the distribution of the templates should be targeted at
+      parProjectDeploymentOU: 
+        default: OU that is allowed to execute this function
+
+Parameters:
+    
+  parRegionDistribution:
+    Description: The regions the distribution of the templates should be targeted at
+    Type: String
+    Default: "us-gov-west-1,us-gov-east-1"
+  parProjectDeploymentOU:
+    Type: String
+    Description: "The org/root/ou path to deploy the execution lambda to"
+    MinLength: "0"
+    MaxLength: "100"
+    AllowedPattern: "^o-[a-z0-9]{10,32}\\/r-[0-9a-z]{4,32}\\/ou-[0-9a-z]{4,32}-[a-z0-9]{8,32}$"
+
+Resources:
+
+  # A role needed for cross account connections. This can be referenced like so in other CF templates:
+  #
+  #   - PolicyName: app-cross-account-dynamodb-assume-role
+  #     PolicyDocument:
+  #       Statement:
+  #       - Effect: Allow
+  #         Action:
+  #           - sts:AssumeRole
+  #         Resource: 
+  #           - !Sub "arn:${AWS::Partition}:iam::${parAppSharedDataAccountId}:role/${parAppSharedDataRoleName}" 
+  AppDynamoDBConnectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "master-dynamodb-account-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: 
+              AWS: "*"
+            Condition: 
+              StringEquals: 
+                aws:PrincipalOrgID: !Select [ 0 , !Split [ "/" , !Ref parProjectDeploymentOU ] ]
+            # Condition: 
+            #   ForAnyValue:StringLike:
+            #     aws:PrincipalOrgPaths: !Ref parProjectDeploymentOU
+            Action: 
+              sts:AssumeRole
+      Policies:
+        - PolicyName: app-policy-dynamo
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/dsop-tools-lookup"
+        - PolicyName: app-policy-kms
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: 
+                - !GetAtt DSOKMSDynamoDBKey.Arn
+
+  # The table for storing our refrence data in
+  DSODynamoDBVersions:
+    Type: AWS::DynamoDB::Table
+    DependsOn: 
+      - DSOKMSDynamoDBKey
+      - DSOKMSDynamoDBKeyAlias
+    Properties: 
+      TableName: "dsop-tools-lookup"
+      AttributeDefinitions:
+        - AttributeName: "settingKey"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "settingKey"
+          KeyType: "HASH"
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: "alias/dsop/cf/parameter-lookup"
+      # There is no reason to do provisioning, this isn"t going to be running non-stop
+      BillingMode: PAY_PER_REQUEST
+
+  # Provides access to read from DynamoDB and encrypt data at rest
+  DSOKMSDynamoDBKey: 
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: "KMS Key for all Versioning Lambda Secrets"
+      EnableKeyRotation: true
+      KeyPolicy: 
+        Version: "2012-10-17"
+        Id: "dsop-tools-lookup-kms-lambda"
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal: 
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+  DSOKMSDynamoDBKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: "alias/dsop/cf/parameter-lookup"
+      TargetKeyId:
+        Ref: DSOKMSDynamoDBKey
+
+  DSOCodeDataLookupFunctionStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AutoDeployment:
+        Enabled: True
+        RetainStacksOnAccountRemoval: false
+      CallAs: DELEGATED_ADMIN
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      Description: Deploys the Lambda Web Application
+      OperationPreferences:
+        FailureTolerancePercentage: 0
+        MaxConcurrentPercentage: 100
+      Parameters:
+        - ParameterKey: parDynamoDbKeyArn
+          ParameterValue: !GetAtt DSOKMSDynamoDBKey.Arn
+        - ParameterKey: parAccountId
+          ParameterValue: !Ref AWS::AccountId
+        - ParameterKey: parDynamoDbTableArn
+          ParameterValue: !GetAtt DSODynamoDBVersions.Arn
+        - ParameterKey: parDynamoDbTableRegion
+          ParameterValue: !Ref AWS::Region
+      PermissionModel: SERVICE_MANAGED
+      StackInstancesGroup:
+        - DeploymentTargets:
+            OrganizationalUnitIds:
+              - !Select [ 2 , !Split [ "/" , !Ref parProjectDeploymentOU ] ]
+          Regions: !Split [ ",", !Ref parRegionDistribution ]
+      StackSetName: !Sub "${AWS::StackName}-Website"
+      TemplateBody: |
+        Parameters:
+        
+          parDynamoDbKeyArn:
+            Type: String
+            Description: "the ARN for the dynmodb table"
+          parDynamoDbTableArn:
+            Type: String
+            Description: "The ARN for the DynamoDB table"
+          parDynamoDbTableRegion:
+            Type: String
+            Description: "The Region for the DynamoDB table"
+          parAccountId:
+            Type: String
+            Description: "The parent stack set account identifier"
+            MinLength: "12"
+            MaxLength: "12"
+        Resources:
+
+          # Defines the function to return the lookup data
+          DSOCodeDataLookupFunction:
+            Type: AWS::Lambda::Function
+            DependsOn: DSOCodeDataLookupFunctionExecutionRole
+            Properties:
+              FunctionName: "dsop-tools-lookup"
+              Handler: "index.handler"
+              Environment:
+                Variables:                
+                  ROLE_TO_ASSUME: !Sub "arn:${AWS::Partition}:iam::${parAccountId}:role/master-dynamodb-account-role"
+                  DYNAMO_DB_REGION: !Ref parDynamoDbTableRegion
+              Code:
+                ZipFile: |
+                  const AWS = require("aws-sdk");
+                  var https = require('https');
+                  var crypto = require("crypto");
+                  var sts = new AWS.STS();
+
+                  function hash(val) { 
+                    return crypto.createHash("sha256").update(val).digest("hex");
+                  }
+
+                  function urlParts(url) {
+                      var remaining = url.substring("https://".length)
+                      var host = remaining.substring(0, remaining.indexOf('/'))
+                      var path = remaining.substring(remaining.indexOf('/'))
+                      return { "hostname": host, "path": path  }
+                  }
+
+                  function putToS3(urlValue, data) {
+
+                    // We need to pull out the URL for host and path
+                    var parsedUrl = urlParts(urlValue);
+
+                    // Convert the data to a JSON string to upload
+                    var asString = JSON.stringify(data)
+
+                    return new Promise((resolve, reject) => {
+
+                        var options = {
+                            hostname: parsedUrl.hostname,
+                            port: 443,
+                            path: parsedUrl.path,
+                            method: "PUT",
+                            headers: {
+                                "content-type": "",
+                                "content-length": asString.length
+                            }
+                        };
+
+                        var str = '';
+                        const req = https.request(options, (res) => {
+                            res.setEncoding('utf8');
+
+                            if (res.statusCode < 200 || res.statusCode >= 300) {
+                                return reject(new Error('statusCode=' + res.statusCode));
+                            }
+                            res.on('data', function (chunk) {
+                                str += chunk;
+                            });
+                            res.on('end', function () {
+                                resolve(str);
+                            });
+                        });
+                        req.on('error', (e) => {
+                            reject(e.message);
+                        });
+
+                        req.write(asString);
+                        req.end();
+                    });
+
+                  }
+
+                  /**
+                  * 
+                  * This method compacts the return value down into something
+                  * that is managable. This probably can be reworked but it 
+                  * works for our needs.
+                  * 
+                  * This supports Strings, StringSets, and Maps (only one level)
+                  * 
+                  * @param item 
+                  * @returns 
+                  */
+                  function collapseToObject(item) {
+                    if (item == null)
+                      return { "Value": null }
+
+                    if (item.S != null) {
+                      return { "Value": item.S }
+                    }
+                    if (item.SS != null) {
+                      return { "Value": item.SS.join(',') }
+                    }
+                    else if (item.M != null) {
+                      var mapData = item.M;
+                      var toReturn = {}
+                      for (const [key, value] of Object.entries(mapData)) {
+
+                        if (value.S != null) {
+                          toReturn[key] = value.S
+                        }
+                        if (value.SS != null) {
+                          toReturn[key] = value.SS.join(',')
+                        }
+
+                      }
+                      return toReturn;
+                    }
+                    return { "Value": null }
+                  }
+
+                  async function assumeRoleForSTSSession() {
+                      var assumedRole = await sts.assumeRole({ RoleArn: process.env.ROLE_TO_ASSUME, RoleSessionName: "cloudformation-lookup" }).promise()
+                      return {
+                          accessKeyId: assumedRole.Credentials.AccessKeyId,
+                          secretAccessKey: assumedRole.Credentials.SecretAccessKey,
+                          sessionToken: assumedRole.Credentials.SessionToken
+                      };
+                  }
+
+                  async function getItem(identifier) {
+                    try {
+                      var sessionData = await assumeRoleForSTSSession()
+                      // Force the region for cross region access
+                      sessionData["region"] = process.env.DYNAMO_DB_REGION;
+                      var ddb = new AWS.DynamoDB(sessionData);
+                      
+                      // Call DynamoDB to read the item from the table
+                      var foundItem = await ddb.getItem({ TableName: "dsop-tools-lookup", Key: { 'settingKey': {S: identifier} } }).promise()
+
+                      if (foundItem == null || foundItem.Item == null) {
+                        return ""
+                      }
+
+                      // Collapse
+                      return collapseToObject(foundItem.Item?.storedValue)
+                    }
+                    catch (ex) {
+                      console.log(ex)
+                      return null
+                    }
+                  }
+
+                  exports.handler = async (event, context) => {
+
+                    // This is what we will write to S3
+                    var dataToWriteToS3 = { }
+
+                    console.log(JSON.stringify(event))
+
+                    try {
+
+                      // Grab the value itself
+                      var itemValue = await getItem(event.ResourceProperties.Value)
+
+                      // If the value is empty then look for a default value
+
+                      if ((itemValue == null || itemValue.length == 0) && event.ResourceProperties.DefaultLookupValue != null) {
+                        itemValue = await getItem(event.ResourceProperties.DefaultLookupValue)
+                      }
+                      // Fall back to the default if it exists
+                      if ((itemValue == null || itemValue.length == 0) && event.ResourceProperties.DefaultValueAsJson != null) {
+                        itemValue = JSON.parse(event.ResourceProperties.DefaultValueAsJson)
+                      }
+                      // Fall back to the default if it exists
+                      if ((itemValue == null || itemValue.length == 0) && event.ResourceProperties.DefaultValue != null) {
+                        itemValue = { "Value": event.ResourceProperties.DefaultValue }
+                      }
+
+                      // Generate a phyiscal resource. Need to create one during the create proccess
+                      var physicalResourceId = event.PhysicalResourceId ?? event.LogicalResourceId + hash(event.StackId);
+
+                      // Successful action, send the data back
+                      dataToWriteToS3 = {
+                        "Status": "SUCCESS",
+                        "RequestId": event.RequestId,
+                        "LogicalResourceId": event.LogicalResourceId,
+                        "StackId": event.StackId,
+                        "NoEcho": true,
+                        "PhysicalResourceId": physicalResourceId,
+                        "Data": itemValue
+                      }
+                    }
+                    catch {
+                      dataToWriteToS3 = {
+                        "Status": "FAILED",
+                        "Reason": "Unknown",
+                        "RequestId": event.RequestId,
+                        "LogicalResourceId": event.LogicalResourceId,
+                        "StackId": event.StackId,
+                        "PhysicalResourceId": physicalResourceId
+                      }
+                    }
+
+                    console.log(JSON.stringify(dataToWriteToS3))
+
+                    // Write the result to S3 now
+                    await putToS3(event.ResponseURL, dataToWriteToS3)
+
+                    // This is done
+                    return { "status": "ok" }
+
+                  }
+
+              Role: !GetAtt DSOCodeDataLookupFunctionExecutionRole.Arn
+              Runtime: "nodejs14.x"
+              Timeout: 5
+              MemorySize: 256
+
+          DSOCodeDataLookupFunctionExecutionRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Sub "dsop-tools-lookup-${AWS::Region}"
+              AssumeRolePolicyDocument:
+                Statement:
+                  - Action: sts:AssumeRole
+                    Effect: Allow
+                    Principal:
+                      Service:
+                        - lambda.amazonaws.com
+                Version: "2012-10-17"
+              Path: /
+              Policies:
+                - PolicyName: app-cross-account-dynamodb-assume-role
+                  PolicyDocument:
+                    Statement:
+                    - Effect: Allow
+                      Action:
+                        - sts:AssumeRole
+                      Resource: 
+                        - !Sub "arn:${AWS::Partition}:iam::${parAccountId}:role/master-dynamodb-account-role" 
+                - PolicyName: "dsop-tools-lookup"
+                  PolicyDocument:
+                    Statement:
+                      - Sid: LogAccessPolicy
+                        Action:
+                          - logs:CreateLogGroup
+                          - logs:DescribeLogGroups
+                          - logs:CreateLogStream
+                          - logs:DescribeLogStreams
+                          - logs:PutLogEvents
+                        Effect: Allow
+                        Resource:
+                          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+                      - Sid: "kms"
+                        Effect: Allow
+                        Action:
+                          - "kms:Decrypt"
+                        Resource:
+                          - !Ref parDynamoDbKeyArn
+                      - Sid: dynamodb
+                        Effect: Allow
+                        Action:
+                          - dynamodb:GetItem
+                        Resource:
+                          - !Ref parDynamoDbTableArn
+                    Version: "2012-10-17"
+                  
+
+
+
