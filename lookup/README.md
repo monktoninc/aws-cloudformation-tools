@@ -121,6 +121,7 @@ Next, deploy the `dsop-parameter-lookup-stackset.yaml` template, providing the f
 
 * `parProjectDeploymentOU`: a path that leads to the production OU for your organization. It will follow this format: org/root/ou
 * `parRegionDistribution`: a comma separated list of regions this could be deployed to. For instances `us-east-1,us-west-1`
+* `parDeployFunctionsOnly`: the initial deployment should be `No`, if you wish to enable this in a test or dev environment, you may want to deploy this again. Setting this flag to `Yes` will deploy only the functions into your target OU.
 
 The org OU structure can be determined by navigating to your Root account and your *AWS Organiztions* configuration. Tap on `AWS Accounts` and view the Organization structure. The path should look something like `o-XXXXXXXXXX/r-XXXX/ou-XXXX-XXXXXXXX`/ 
 

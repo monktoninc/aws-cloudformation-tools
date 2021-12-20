@@ -43,6 +43,7 @@ Metadata:
         Parameters:
           - parProjectDeploymentOU
           - parRegionDistribution
+          - parDeployFunctionsOnly
 
     ParameterLabels:
 
@@ -50,13 +51,16 @@ Metadata:
         Description: The regions the distribution of the templates should be targeted at
       parProjectDeploymentOU: 
         default: OU that is allowed to execute this function
+      parDeployFunctionsOnly: 
+        default: Deploy only functions
 
 Parameters:
     
   parRegionDistribution:
     Description: The regions the distribution of the templates should be targeted at
-    Type: String
+    Type: CommaDelimitedList
     Default: "us-gov-west-1,us-gov-east-1"
+
   parProjectDeploymentOU:
     Type: String
     Description: "The org/root/ou path to deploy the execution lambda to"
@@ -64,12 +68,27 @@ Parameters:
     MaxLength: "100"
     AllowedPattern: "^o-[a-z0-9]{10,32}\\/r-[0-9a-z]{4,32}\\/ou-[0-9a-z]{4,32}-[a-z0-9]{8,32}$"
 
+  parDeployFunctionsOnly:
+    Type: String
+    Default: "No"
+    Description: "If you are deploying to multiple OU paths, you will only need to deploy the DynamoDB once. Select Yes to deploy just the functions to a separate account"
+    AllowedValues:
+      - "No"
+      - "Yes"
+ 
+Conditions:
+  
+  ConditionDeployFunctionsOnly:   !Equals [ !Ref parDeployFunctionsOnly, "Yes" ]
+  ConditionDeployEverything:      !Equals [ !Ref parDeployFunctionsOnly, "No" ]
+      
+            
 Resources:
 
   # A role needed for cross account connections, assume this role in the Lambda function to 
   # get data out of the DynamoDB table
   AppDynamoDBConnectionRole:
     Type: AWS::IAM::Role
+    Condition: ConditionDeployEverything
     Properties:
       RoleName: "master-dynamodb-account-role"
       AssumeRolePolicyDocument:
@@ -80,9 +99,6 @@ Resources:
             Condition: 
               StringEquals: 
                 aws:PrincipalOrgID: !Select [ 0 , !Split [ "/" , !Ref parProjectDeploymentOU ] ]
-            # Condition: 
-            #   ForAnyValue:StringLike:
-            #     aws:PrincipalOrgPaths: !Ref parProjectDeploymentOU
             Action: 
               sts:AssumeRole
       Policies:
@@ -106,6 +122,7 @@ Resources:
   # The table for storing our refrence data in
   DSODynamoDBVersions:
     Type: AWS::DynamoDB::Table
+    Condition: ConditionDeployEverything
     DependsOn: 
       - DSOKMSDynamoDBKey
       - DSOKMSDynamoDBKeyAlias
@@ -127,6 +144,7 @@ Resources:
   # Provides access to read from DynamoDB and encrypt data at rest
   DSOKMSDynamoDBKey: 
     Type: AWS::KMS::Key
+    Condition: ConditionDeployEverything
     Properties: 
       Description: "KMS Key for all Versioning Lambda Secrets"
       EnableKeyRotation: true
@@ -141,12 +159,15 @@ Resources:
             Action: "kms:*"
             # "*" is fine here as this is scoped to the key itself 
             Resource: "*"
+  
   DSOKMSDynamoDBKeyAlias:
     Type: AWS::KMS::Alias
+    Condition: ConditionDeployEverything
     Properties:
       AliasName: "alias/dsop/cf/parameter-lookup"
       TargetKeyId:
         Ref: DSOKMSDynamoDBKey
+
 
   DSOCodeDataLookupFunctionStackSet:
     Type: AWS::CloudFormation::StackSet
@@ -164,11 +185,19 @@ Resources:
         MaxConcurrentPercentage: 100
       Parameters:
         - ParameterKey: parDynamoDbKeyArn
-          ParameterValue: !GetAtt DSOKMSDynamoDBKey.Arn
+          ParameterValue: 
+            !If 
+              - ConditionDeployEverything
+              - !GetAtt DSOKMSDynamoDBKey.Arn
+              - !ImportValue "Monkton-LookupKeyARN"
+        - ParameterKey: parDynamoDbTableArn
+          ParameterValue: 
+            !If 
+              - ConditionDeployEverything
+              - !GetAtt DSODynamoDBVersions.Arn
+              - !ImportValue "Monkton-LookupDynamoDBARN"
         - ParameterKey: parAccountId
           ParameterValue: !Ref AWS::AccountId
-        - ParameterKey: parDynamoDbTableArn
-          ParameterValue: !GetAtt DSODynamoDBVersions.Arn
         - ParameterKey: parDynamoDbTableRegion
           ParameterValue: !Ref AWS::Region
       PermissionModel: SERVICE_MANAGED
@@ -176,8 +205,8 @@ Resources:
         - DeploymentTargets:
             OrganizationalUnitIds:
               - !Select [ 2 , !Split [ "/" , !Ref parProjectDeploymentOU ] ]
-          Regions: !Split [ ",", !Ref parRegionDistribution ]
-      StackSetName: !Sub "${AWS::StackName}-Website"
+          Regions: !Ref parRegionDistribution
+      StackSetName: !Sub "${AWS::StackName}-StackSet"
       TemplateBody: |
         Parameters:
         
@@ -430,7 +459,7 @@ Resources:
                         - sts:AssumeRole
                       Resource: 
                         - !Sub "arn:${AWS::Partition}:iam::${parAccountId}:role/master-dynamodb-account-role" 
-                - PolicyName: "dsop-tools-lookup"
+                - PolicyName: "execution-role-permissions"
                   PolicyDocument:
                     Statement:
                       - Sid: LogAccessPolicy
@@ -459,4 +488,20 @@ Resources:
                   
 
 
+
+Outputs:
+
+  LookupKeyARN:
+    Condition: ConditionDeployEverything
+    Description: The Lookup Template Key ARN
+    Value: !GetAtt DSOKMSDynamoDBKey.Arn
+    Export: 
+      Name: "Monkton-LookupKeyARN"
+
+  LookupDynamoDBARN:
+    Condition: ConditionDeployEverything
+    Description: The Lookup Table ARN
+    Value: !GetAtt DSODynamoDBVersions.Arn
+    Export: 
+      Name: "Monkton-LookupDynamoDBARN"
 
