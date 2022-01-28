@@ -487,12 +487,6 @@ Resources:
                 Effect: Allow
                 Resource:
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
-              - Sid: kms
-                Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
               - Sid: secretsmanageraccess
                 Effect: Allow
                 Action:
