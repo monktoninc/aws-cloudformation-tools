@@ -1,0 +1,540 @@
+---
+##  The MIT License (MIT)
+## 
+##  Copyright (c) 2022 Monkton, Inc
+## 
+##  Permission is hereby granted, free of charge, to any person obtaining a copy
+##  of this software and associated documentation files (the "Software"), to deal
+##  in the Software without restriction, including without limitation the rights
+##  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+##  copies of the Software, and to permit persons to whom the Software is
+##  furnished to do so, subject to the following conditions:
+## 
+##  The above copyright notice and this permission notice shall be included in all
+##  copies or substantial portions of the Software.
+## 
+##  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+##  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+##  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+##  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+##  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+##  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+##  SOFTWARE.
+## 
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Monkton Pricing Distributor Function
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 20210825
+  Identifier:
+    Value: pricing-distributor-function
+  Input:
+    Description: Sends out daily pricing metrics to see burn in AWS Account
+  Output:
+    Description: N/A
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+
+      - Label:
+          default: Distribution Settings
+        Parameters:
+          - parDistributionContent
+          - parAlertDailyChange
+          - parAccountName
+          - parTimeUTCToSend
+
+    ParameterLabels:
+
+      parAccountName:
+        default: Account Name Identifier 
+      parDistributionContent:
+        default: Methods of distribution in JSON
+      parAlertDailyChange:
+        default: Daily Change Max Threshold to warn
+      parTimeUTCToSend:
+        default: cron hour to send reports UTC
+    
+Parameters:
+    
+  parTimeUTCToSend:
+    Type: String
+    Default: 5
+    Description: UTC Hour to execute cron job, every day. Job executes on the hour daily. 
+    AllowedValues:
+      - "0"
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+      - "6"
+      - "7"
+      - "8"
+      - "9"
+      - "10"
+      - "11"
+      - "12"
+      - "13"
+      - "14"
+      - "15"
+      - "16"
+      - "17"
+      - "18"
+      - "19"
+      - "20"
+      - "21"
+      - "22"
+      - "23"
+    
+  parDistributionContent:
+    Type: String
+    Description: JSON formatted string that contains publish information for the function
+    NoEcho: true
+    
+  parAlertDailyChange:
+    Type: Number
+    Description: A value that indicates a daily change to provide a more detailed alert
+    MinValue: 5
+    MaxValue: 100000
+    
+  parAccountName:
+    Type: String
+    Description: Provides a name for emails and slack when sending out the usage reports
+    
+
+Resources:
+
+  # Defines the function to return the lookup data
+  DailyPricingDistributorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DailyPricingDistributorFunctionExecutionRole
+    Properties:
+      FunctionName: "daily-pricing-distributor"
+      Handler: "index.handler"
+      Environment:
+        Variables:
+          SSM_ARN: !Ref DailyPricingDistributorEndpointDataSecret
+          AWS_PARTITION: !Ref "AWS::Partition"
+          ALERT_DAILY_CHANGE: !Ref parAlertDailyChange
+          ACCOUNT_NAME: !Ref parAccountName
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+          var https = require('https');
+          var crypto = require("crypto");
+          var sts = new AWS.STS();
+
+
+          async function getSecretValue(name) {
+            
+            
+            var ssm = new AWS.SecretsManager();
+            
+              var result = await ssm.getSecretValue({ SecretId: name }).promise();
+              
+              if (result == null) {
+                return null;
+              }
+              return JSON.parse(result.SecretString)
+              
+          }
+
+
+          function convertDate(date) {
+            var yyyy = date.getFullYear().toString();
+            var mm = (date.getMonth()+1).toString();
+            var dd  = date.getDate().toString();
+
+            var mmChars = mm.split('');
+            var ddChars = dd.split('');
+
+            return yyyy + '-' + (mmChars[1]?mm:"0"+mmChars[0]) + '-' + (ddChars[1]?dd:"0"+ddChars[0]);
+          }
+
+          /* We want to compare everything up until the day before yesterday to see if we are out of wack */
+          async function aggregateUpUntilToday() {
+            var date = new Date();
+            
+            // Get the day of the month
+            let dayOfMonth = date.getDate();
+            
+            // Adjust if necessary
+            if (dayOfMonth >= 1)
+              dayOfMonth = dayOfMonth - 1;
+            
+            // We are going to hardcode this at 2, because it we do 1 it will pull in previous month
+            var firstDay = convertDate(new Date(date.getFullYear(), date.getMonth(), 1));
+            
+            // Compute the current value
+            var lastDay = convertDate(new Date(date.getFullYear(), date.getMonth(), dayOfMonth < 2 ? 2 : dayOfMonth));
+            
+            var params = {
+              "TimePeriod": {
+                "Start": firstDay,
+                "End": lastDay
+              },
+              "Granularity": "MONTHLY",
+              "Metrics": [
+                "BlendedCost"
+              ],
+              "GroupBy": [
+                {
+                  "Type": "DIMENSION",
+                  "Key": "LINKED_ACCOUNT"
+                }
+              ]
+            }
+
+            var costexplorer = new AWS.CostExplorer();
+            
+            let results = await costexplorer.getCostAndUsage(params).promise()
+            
+            // The total aggregate amount for this entire organization
+            let total = 0.0
+            
+            for (var byTimeIterator = 0; byTimeIterator < results.ResultsByTime[0].Groups.length; byTimeIterator++) {
+              
+              // The total amount this account has billed
+              let accountTotal = parseFloat(results.ResultsByTime[0].Groups[byTimeIterator].Metrics.BlendedCost.Amount);
+              
+              // Update the overall total
+              total += accountTotal;
+              
+            }
+            
+            return total;
+            
+          }
+
+          exports.handler = async (event, context) => {
+            
+            // Lets figure out what we've spent up until today, we will use this for alerts if necessary
+            let totalBeforeToday = await aggregateUpUntilToday();
+            
+            var date = new Date();
+            
+            // The first day of this month
+            var firstDay = convertDate(new Date(date.getFullYear(), date.getMonth(), 1));
+            var lastDay = convertDate(new Date(date.getFullYear(), date.getMonth() + 1, 0));
+            
+            // Lets keep track of this, we may not care to do a comparison 
+            var isFirstOfMonth = date.getDate() == 1
+            
+            
+            // Create our number formatter.
+            var formatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+            
+            
+            var params = {
+              "TimePeriod": {
+                "Start": firstDay,
+                "End": lastDay
+              },
+              "Granularity": "MONTHLY",
+              "Metrics": [
+                "BlendedCost"
+              ],
+              "GroupBy": [
+                {
+                  "Type": "DIMENSION",
+                  "Key": "LINKED_ACCOUNT"
+                }
+              ]
+            }
+
+            var costexplorer = new AWS.CostExplorer();
+            
+            let results = await costexplorer.getCostAndUsage(params).promise()
+            
+            // Accounts that are under this Organization
+            let mappedAccounts = results.DimensionValueAttributes
+            
+            // The total aggregate amount for this entire organization
+            let total = 0.0
+            
+            var dataToSendToSlack = ""
+            var dataToSendToEmail = ""
+            
+            // Lets figure out if we have more than 1 account
+            let hasMoreThanOneAccount = results.ResultsByTime[0].Groups.length > 0;
+            
+            for (var byTimeIterator = 0; byTimeIterator < results.ResultsByTime[0].Groups.length; byTimeIterator++) {
+              
+              // The identifier of the account we are working with
+              let accountIdentifier = results.ResultsByTime[0].Groups[byTimeIterator].Keys[0]
+              
+              // Find the mapped account we are providing the report on
+              var result = mappedAccounts.filter(obj => { return obj.Value == accountIdentifier })
+              
+              // Grab the description 
+              let accountName = result[0].Attributes.description;
+              
+              // The total amount this account has billed
+              let accountTotal = parseFloat(results.ResultsByTime[0].Groups[byTimeIterator].Metrics.BlendedCost.Amount);
+              
+              // Update the overall total
+              total += accountTotal;
+              
+              // Append our data to push to slack
+              dataToSendToSlack += `*${accountName}*: _${formatter.format(accountTotal)}_\n`
+              dataToSendToEmail += `<tr><td>${accountName}</td><td>${formatter.format(accountTotal)}</td></tr>`
+              
+              
+            }
+            
+            // Update this, throw the total up top
+            dataToSendToSlack = `*Current monthly spend is*\n*Account Total*: _${formatter.format(total)}_\n` + dataToSendToSlack;
+            dataToSendToEmail += `<tr><td>Account Total</td><td>${formatter.format(total)}</td></tr>`
+              
+              
+            // Update our email output
+            dataToSendToEmail = "<div><table>" + dataToSendToEmail + "</table></div>"
+              
+            // Grab the SSM value
+            var secretValue = await getSecretValue(process.env.SSM_ARN)
+            
+            // Figure out if we need to alert
+            let maxDelta = parseInt(process.env.ALERT_DAILY_CHANGE);
+            
+            if (totalBeforeToday + maxDelta < total) {
+              dataToSendToSlack = `*WARNING: Daily threshold change has been exceeded*\n` + dataToSendToSlack;
+              dataToSendToEmail = "<div><h2>WARNING: Daily threshold change has been exceeded</h2></div>" + dataToSendToEmail
+            }
+            
+            // Check email values
+            if (secretValue.emails != null && secretValue.sesCredentials != null
+              && secretValue.sesCredentials.accessKey != null && secretValue.sesCredentials.secretKey != null
+              && secretValue.sesCredentials.from != null) {
+              
+            }
+            
+            // Send our slack messages
+            if (secretValue.slack != null) {
+              for (var x = 0; x < secretValue.slack.length; x++) {
+                await pushToSlack(secretValue.slack[x], {"icon_emoji": ":ghost:", "username": "AWS Cost Bot", "text": `${dataToSendToSlack}`  });
+              }
+            }
+            
+            // Send our slack messages
+            if (secretValue.emails != null) {
+              for (var x = 0; x < secretValue.emails.length; x++) {
+                await sendEmail(secretValue, secretValue.emails[x], dataToSendToEmail, `AWS Usage for ${process.env.ACCOUNT_NAME}`);
+              }
+            }
+            
+            
+            
+            
+            return { "status": "sent", "previousTotal": formatter.format(totalBeforeToday), "total": formatter.format(total) }
+
+          }
+
+
+          async function sendEmail(ssmData, to, html, subject) {
+            let config = {
+                apiVersion: "2010-12-01",
+                accessKeyId: ssmData.sesCredentials.accessKey,
+                secretAccessKey: ssmData.sesCredentials.secretKey,
+                region: "us-east-1"
+            }
+                                
+              await (new AWS.SES(config).sendEmail(makeEmail(ssmData.sesCredentials.from, to, html, subject)).promise())
+          }
+
+          function makeEmail(from, to, html, subject) {
+              
+              return {
+                  Source: from,
+                  Destination: {
+                      ToAddresses: [
+                          to
+                      ]
+                  },
+                  ReplyToAddresses: [
+                      from
+                  ],
+                  Message: {
+                      Body: {
+                          Html: {
+                              Charset: "UTF-8",
+                              Data: html
+                          }
+                      },
+                  Subject: {
+                      Charset: "UTF-8",
+                      Data: subject
+                  }
+                  }
+              };
+
+          }
+
+          /** Enables us to sleep if we need to **/
+          function sleep(millis) {
+              return new Promise(resolve => setTimeout(resolve, millis));
+          }
+
+          /** Splits out parts of the URL. This is quick and dirty and could be improved **/
+          function urlParts(url) {
+              var remaining = url.substring("https://".length)
+              var host = remaining.substring(0, remaining.indexOf('/'))
+              var path = remaining.substring(remaining.indexOf('/'))
+              return { "hostname": host, "path": path  }
+          }
+
+          /** Publishes to Slack using native NodeJS services **/
+          function pushToSlack(url, data) {
+
+            // We need to pull out the URL for host and path
+            var parsedUrl = urlParts(url);
+
+
+            // Convert the data to a JSON string to upload
+            var asString = JSON.stringify(data)
+
+            return new Promise((resolve, reject) => {
+
+                var options = {
+                    hostname: parsedUrl.hostname,
+                    port: 443,
+                    path: parsedUrl.path,
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/javascript",
+                        "content-length": asString.length
+                    }
+                };
+
+                var str = '';
+                const req = https.request(options, (res) => {
+                    res.setEncoding('utf8');
+
+                    if (res.statusCode < 200 || res.statusCode >= 300) {
+                        return reject(new Error('statusCode=' + res.statusCode));
+                    }
+                    res.on('data', function (chunk) {
+                        str += chunk;
+                    });
+                    res.on('end', function () {
+                        resolve(str);
+                    });
+                });
+                req.on('error', (e) => {
+                    reject(e.message);
+                });
+
+                req.write(asString);
+                req.end();
+            });
+
+          }
+
+
+
+
+
+
+
+
+      Role: !GetAtt DailyPricingDistributorFunctionExecutionRole.Arn
+      Runtime: "nodejs14.x"
+      Timeout: 5
+      MemorySize: 256
+
+
+  DailyPricingDistributorEndpointDataSecretKey: 
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: "KMS Key for Pricing Distribution Settings"
+      KeyPolicy: 
+        Version: "2012-10-17"
+        Id: "kmsssm"
+        Statement:
+        - Sid: "Enable IAM User Permissions"
+          Effect: "Allow"
+          Principal: 
+            AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+          Action: "kms:*"
+          Resource: "*"
+          
+  DailyPricingDistributorEndpointDataSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "daily-pricing-distributor-secret"
+      KmsKeyId: !Ref DailyPricingDistributorEndpointDataSecretKey
+      Description: "Pricing Information Configuration JSON"
+      SecretString: !Ref parDistributionContent
+
+  DailyPricingDistributorFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "daily-pricing-distributor-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: "2012-10-17"
+      Path: /
+      Policies:
+        - PolicyName: "execution-role-permissions"
+          PolicyDocument:
+            Statement:
+              - Sid: LogAccessPolicy
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              - Sid: kms
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+              - Sid: secretsmanageraccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DailyPricingDistributorEndpointDataSecret
+              - Sid: secretsmanagerkms
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !GetAtt DailyPricingDistributorEndpointDataSecretKey.Arn
+              - Sid: costs
+                Effect: Allow
+                Action:
+                  - ce:*
+                Resource:
+                  - "*"
+            Version: "2012-10-17"
+
+  DailyPricingDistributorScheduleRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Daily Pricing Scheduler"
+      ScheduleExpression: !Sub "cron(0 ${parTimeUTCToSend} * * ? *)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt DailyPricingDistributorFunction.Arn
+          Id: !Ref DailyPricingDistributorFunction
+
+  DailyPricingDistributorScheduleRulePermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref DailyPricingDistributorFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt DailyPricingDistributorScheduleRule.Arn
