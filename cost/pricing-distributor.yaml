@@ -303,14 +303,7 @@ Resources:
               dataToSendToSlack = `*WARNING: Daily threshold change has been exceeded*\n` + dataToSendToSlack;
               dataToSendToEmail = "<div><h2>WARNING: Daily threshold change has been exceeded</h2></div>" + dataToSendToEmail
             }
-            
-            // Check email values
-            if (secretValue.emails != null && secretValue.sesCredentials != null
-              && secretValue.sesCredentials.accessKey != null && secretValue.sesCredentials.secretKey != null
-              && secretValue.sesCredentials.from != null) {
-              
-            }
-            
+                        
             // Send our slack messages
             if (secretValue.slack != null) {
               for (var x = 0; x < secretValue.slack.length; x++) {
@@ -318,15 +311,14 @@ Resources:
               }
             }
             
-            // Send our slack messages
-            if (secretValue.emails != null) {
+            // Check email values
+            if (secretValue.emails != null && secretValue.sesCredentials != null
+              && secretValue.sesCredentials.accessKey != null && secretValue.sesCredentials.secretKey != null
+              && secretValue.sesCredentials.from != null) {
               for (var x = 0; x < secretValue.emails.length; x++) {
                 await sendEmail(secretValue, secretValue.emails[x], dataToSendToEmail, `AWS Usage for ${process.env.ACCOUNT_NAME}`);
               }
             }
-            
-            
-            
             
             return { "status": "sent", "previousTotal": formatter.format(totalBeforeToday), "total": formatter.format(total) }
 
@@ -516,7 +508,7 @@ Resources:
               - Sid: costs
                 Effect: Allow
                 Action:
-                  - ce:*
+                  - ce:GetCostAndUsage
                 Resource:
                   - "*"
             Version: "2012-10-17"
